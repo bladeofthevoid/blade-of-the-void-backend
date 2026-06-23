@@ -1,13 +1,20 @@
 {
-  "name": "combat-game-foundation",
-  "version": "0.1.0",
+  "name": "blade-of-the-void-foundation",
+  "version": "0.2.0",
   "private": true,
-  "description": "Server-authoritative multiplayer browser game foundation (WebSockets + Three.js).",
-  "main": "server.js",
+  "description": "Server-authoritative multiplayer browser game foundation (WebSockets + Three.js), expanded into a multi-instance Gateway + World Server architecture.",
+  "main": "world/WorldServer.js",
   "scripts": {
-    "start": "node server.js"
+    "gateway": "node gateway/gateway.js",
+    "world": "node world/WorldServer.js",
+    "start": "node world/WorldServer.js",
+    "dev:cluster": "concurrently -n gateway,world-a,world-b -c blue,green,yellow \"npm:gateway\" \"cross-env SERVER_ID=FRA-01 PORT=8080 npm:world\" \"cross-env SERVER_ID=FRA-02 PORT=8081 npm:world\""
   },
   "dependencies": {
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3"
   }
 }
