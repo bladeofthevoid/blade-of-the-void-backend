@@ -28,6 +28,12 @@ class Player extends Entity {
     this.inputQueue = [];
     this.lastProcessedInputSeq = 0;
 
+    // Set by World.addPlayer() when this player is created. Lets a
+    // dropped client reconnect (C2S_REJOIN) and resume this exact entity
+    // instead of respawning, as long as it arrives within
+    // RELIABILITY.REJOIN_GRACE_MS of disconnecting. See World.js.
+    this.rejoinToken = null;
+
     // Free-form slot for future per-player combat state (health, stamina,
     // lock-on target, combo state, ...). Left empty deliberately -- this
     // project's scope explicitly excludes combat, but the field exists so
