@@ -1,0 +1,1428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Combat Game Foundation</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: #15151c;
+    font-family: 'Courier New', monospace;
+  }
+  canvas { display: block; }
+
+  #debug-ui {
+    position: fixed;
+    top: 10px;
+    left: 10px;
+    color: #6cf06c;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 10px 14px;
+    font-size: 12px;
+    line-height: 1.5;
+    border-radius: 6px;
+    white-space: pre;
+    z-index: 10;
+    pointer-events: none;
+  }
+
+  #connection-status {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    z-index: 10;
+    pointer-events: none;
+  }
+
+  #controls-hint {
+    position: fixed;
+    bottom: 10px;
+    left: 10px;
+    color: #ccc;
+    background: rgba(0, 0, 0, 0.45);
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    z-index: 10;
+    pointer-events: none;
+  }
+
+  /*
+   * Generic transition overlay. Today it only covers the gateway -> world
+   * handoff (a few hundred ms, typically invisible), but it's built as a
+   * standalone component (see LoadingScreen class) so a future, much
+   * longer loading sequence (asset streaming, terrain generation, etc.)
+   * can reuse the exact same show/hide/setMessage API without touching
+   * NetworkManager or Game's connection logic at all.
+   */
+  #loading-screen {
+    position: fixed;
+    inset: 0;
+    background: #11111a;
+    color: #e8e8f0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    z-index: 100;
+    font-family: 'Courier New', monospace;
+    transition: opacity 0.25s ease;
+  }
+  #loading-screen.hidden {
+    opacity: 0;
+    pointer-events: none;
+  }
+  #loading-screen .spinner {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: 3px solid #3a3a4a;
+    border-top-color: #6cf06c;
+    animation: loading-spin 0.8s linear infinite;
+  }
+  #loading-screen .loading-message {
+    font-size: 13px;
+    color: #aaa;
+    letter-spacing: 0.5px;
+  }
+  #loading-screen .loading-error {
+    color: #ff6b6b;
+    font-size: 13px;
+    max-width: 320px;
+    text-align: center;
+  }
+  @keyframes loading-spin {
+    to { transform: rotate(360deg); }
+  }
+</style>
+
+<!--
+  No bundler / build step, per project requirements: this importmap lets
+  the module script below `import * as THREE from 'three'` directly from
+  a CDN. If this project later grows addons (postprocessing, loaders),
+  add their CDN paths here too.
+-->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="debug-ui">connecting...</div>
+<div id="connection-status">connecting...</div>
+<div id="controls-hint">WASD move &middot; drag mouse to orbit camera &middot; scroll to zoom</div>
+
+<div id="loading-screen">
+  <div class="spinner"></div>
+  <div class="loading-message" id="loading-message">Connecting to gateway&hellip;</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* =========================================================================
+ * SECTION: CONFIG
+ * -------------------------------------------------------------------------
+ * Two tiers of configuration:
+ *   1. ClientConfig    - purely local presentation/network tuning that has
+ *                        no bearing on simulation correctness (interpolation
+ *                        delay, ping interval, smoothing speed...).
+ *   2. MovementConfig / ServerTickRate / SnapshotRate / WorldBounds
+ *                      - authoritative values. These start with sane
+ *                        fallback defaults but are OVERWRITTEN the moment
+ *                        the server's 'welcome' message arrives (see
+ *                        NetworkManager.onWelcome below). This guarantees
+ *                        the client's prediction math always matches
+ *                        whatever the server is actually running, instead
+ *                        of relying on two hand-maintained copies of the
+ *                        same numbers staying in sync.
+ * ========================================================================= */
+
+/*
+ * Multi-instance note: the single-server foundation hardcoded one
+ * backend URL and connected to it directly. That model is gone -- the
+ * client now ALWAYS talks to a gateway first (see GatewayConfig below)
+ * and only ever reaches a world server because the gateway told it to.
+ * Leave HARDCODED_GATEWAY_URL empty to use the same origin the page was
+ * served from (the normal case: the gateway serves index.html itself).
+ * Set it only if your static assets are hosted separately from the
+ * gateway (e.g. behind a CDN) and need to point at a gateway on a
+ * different host.
+ */
+const HARDCODED_GATEWAY_URL = '';
+
+const ClientConfig = {
+  GATEWAY_URL: HARDCODED_GATEWAY_URL || (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host,
+
+  // How far in the past (in milliseconds) remote players are rendered.
+  // Snapshots arrive at SNAPSHOT_RATE (20Hz = every 50ms); buffering a
+  // little extra beyond one interval gives the interpolator two real
+  // samples to interpolate between even if one packet is briefly late,
+  // at the cost of remote players appearing slightly "behind" real time.
+  INTERP_DELAY_MS: 100,
+
+  PING_INTERVAL_MS: 1000,
+
+  // Controls how quickly the visually-rendered local player position
+  // catches up to the (possibly just-corrected) simulated position.
+  // Smaller = snappier but more visible pop on correction;
+  // larger = smoother but mushier-feeling movement. See Predictor.updateVisual.
+  VISUAL_SMOOTHING: 0.00001,
+
+  // World transfer / reliability tuning (see NetworkManager.connectToWorld
+  // and Game._handleWorldDisconnected). A dropped world connection first
+  // retries directly against the same world server (cheap, preserves the
+  // rejoin token's entity-restoring grace window) before falling all the
+  // way back to asking the gateway for a brand new assignment.
+  MAX_DIRECT_RECONNECT_ATTEMPTS: 3,
+  RECONNECT_BASE_DELAY_MS: 1000,
+};
+
+// Which world type to request, e.g. ?type=pvp in the page URL. Falls back
+// to the server's own default (see config/constants.js DEFAULT_WORLD_TYPE)
+// when omitted -- the client deliberately does not hardcode a default
+// here, so the server stays the single source of truth for it.
+const REQUESTED_WORLD_TYPE = new URLSearchParams(location.search).get('type') || undefined;
+
+// Authoritative values -- placeholders until 'welcome' arrives.
+let MovementConfig = { MAX_SPEED: 6, ACCELERATION: 40, FRICTION: 18, TURN_RATE: 12 };
+let ServerTickRate = 30;
+let SnapshotRate = 20;
+let WorldBounds = 50;
+
+// Mirrors network/MessageTypes.js on the server EXACTLY. If you add a
+// message type on the server, add it here too.
+const MessageTypes = {
+  // World protocol -- unchanged from the single-server foundation.
+  C2S_INPUT: 'input',
+  C2S_PING: 'ping',
+  S2C_WELCOME: 'welcome',
+  S2C_SNAPSHOT: 'snapshot',
+  S2C_PONG: 'pong',
+  S2C_PLAYER_JOINED: 'player_joined',
+  S2C_PLAYER_LEFT: 'player_left',
+
+  // Gateway handshake -- new.
+  S2C_REDIRECT: 'redirect',
+  S2C_ASSIGNMENT_ERROR: 'assignment_error',
+
+  // World server connection identity + reconnect -- new.
+  S2C_CONNECTION_INFO: 'connection_info',
+  S2C_REJOIN_FAILED: 'rejoin_failed',
+};
+
+const UP_VECTOR = new THREE.Vector3(0, 1, 0);
+
+
+/* =========================================================================
+ * SECTION: MOVEMENT SYSTEM (mirrors simulation/MovementSystem.js)
+ * -------------------------------------------------------------------------
+ * This MUST stay logically identical to the server's copy. It is what
+ * makes client-side prediction valid: the client runs the exact same
+ * deterministic step function the server will eventually run for the
+ * same input, so its prediction should match the server's eventual
+ * authoritative result almost exactly, with reconciliation only ever
+ * correcting for genuine network-induced drift rather than a logic
+ * mismatch between the two sides.
+ * ========================================================================= */
+
+class MovementSystem {
+  static step(state, input, dt, cfg) {
+    const dirX = input.dirX || 0;
+    const dirZ = input.dirZ || 0;
+    const hasInput = dirX !== 0 || dirZ !== 0;
+
+    if (hasInput) {
+      const len = Math.hypot(dirX, dirZ) || 1;
+      const nx = dirX / len;
+      const nz = dirZ / len;
+
+      const targetVX = nx * cfg.MAX_SPEED;
+      const targetVZ = nz * cfg.MAX_SPEED;
+
+      state.velocity.x = MovementSystem._approach(state.velocity.x, targetVX, cfg.ACCELERATION * dt);
+      state.velocity.z = MovementSystem._approach(state.velocity.z, targetVZ, cfg.ACCELERATION * dt);
+
+      const targetYaw = Math.atan2(nx, nz);
+      state.rotationY = MovementSystem._approachAngle(state.rotationY, targetYaw, cfg.TURN_RATE * dt);
+
+      state.movementState = 'moving';
+    } else {
+      state.velocity.x = MovementSystem._approach(state.velocity.x, 0, cfg.FRICTION * dt);
+      state.velocity.z = MovementSystem._approach(state.velocity.z, 0, cfg.FRICTION * dt);
+      state.movementState = 'idle';
+    }
+
+    state.position.x += state.velocity.x * dt;
+    state.position.z += state.velocity.z * dt;
+    state.position.y = 0;
+
+    return state;
+  }
+
+  static _approach(current, target, maxDelta) {
+    if (current < target) return Math.min(current + maxDelta, target);
+    if (current > target) return Math.max(current - maxDelta, target);
+    return current;
+  }
+
+  static _approachAngle(current, target, maxDelta) {
+    let diff = target - current;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    const delta = Math.max(-maxDelta, Math.min(maxDelta, diff));
+    return current + delta;
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: NETWORK MANAGER
+ * -------------------------------------------------------------------------
+ * Owns the WebSocket connection exclusively. Knows nothing about Three.js,
+ * entities, or prediction -- it just parses incoming JSON and invokes
+ * callbacks, and offers sendInput()/send() for the rest of the client to
+ * push messages out. This mirrors the server's WebSocketServer wrapper:
+ * the wire format lives in exactly one place per side.
+ *
+ * Multi-instance addition: connecting is now a two-phase handoff instead
+ * of one connect() call, matching the architecture's CLIENT -> Gateway ->
+ * World Server flow:
+ *   1. connectToGateway() opens a short-lived socket whose only possible
+ *      outcomes are S2C_REDIRECT (here's your world) or
+ *      S2C_ASSIGNMENT_ERROR (no room anywhere) -- the gateway closes this
+ *      socket itself right after, by design (see gateway/gateway.js).
+ *   2. connectToWorld() opens the real, long-lived gameplay connection.
+ *      Everything from here down (S2C_WELCOME onward) is byte-for-byte
+ *      the same protocol the single-server foundation used.
+ *
+ * onWorldDisconnected fires only when the WORLD connection drops
+ * unexpectedly (never when the gateway's own intentional post-redirect
+ * close happens) -- that's the signal Game uses to attempt a reconnect.
+ * ========================================================================= */
+
+class NetworkManager {
+  constructor() {
+    this.ws = null;
+    this.connected = false;
+    this.localId = null;
+    this.ping = 0;
+
+    // Populated once S2C_CONNECTION_INFO / S2C_WELCOME arrive. Purely
+    // informational (debug UI + reconnect bookkeeping) -- nothing in the
+    // movement/prediction pipeline reads these.
+    this.serverId = null;
+    this.worldId = null;
+    this.worldType = null;
+    this.rejoinToken = null;
+
+    this.onRedirect = null;          // (assignment) => void
+    this.onAssignmentError = null;   // (reason) => void
+    this.onConnectionInfo = null;    // (msg) => void
+    this.onWelcome = null;           // (msg) => void
+    this.onSnapshot = null;          // (msg) => void
+    this.onPlayerJoined = null;      // (id) => void
+    this.onPlayerLeft = null;        // (id) => void
+    this.onRejoinFailed = null;      // () => void
+    this.onWorldDisconnected = null; // () => void -- unexpected drop of the WORLD connection only
+
+    this._pingTimer = null;
+    this._phase = null; // 'gateway' | 'world'
+  }
+
+  /** Phase 1: ask the gateway where to go. Expect S2C_REDIRECT or S2C_ASSIGNMENT_ERROR, never gameplay messages. */
+  connectToGateway(gatewayUrl, worldType) {
+    this._phase = 'gateway';
+    this._open(buildWsUrl(gatewayUrl, worldType ? { type: worldType } : {}));
+  }
+
+  /** Phase 2: the real, long-lived gameplay connection to a specific world server + world. */
+  connectToWorld(wsUrl, worldId, rejoinToken) {
+    this._phase = 'world';
+    const params = rejoinToken ? { worldId, rejoinToken } : { worldId };
+    this._open(buildWsUrl(wsUrl, params));
+  }
+
+  _open(url) {
+    this._teardownSocket();
+    this.connected = false;
+
+    const socket = new WebSocket(url);
+    this.ws = socket;
+
+    socket.onopen = () => {
+      if (this.ws !== socket) return; // superseded by a newer connect() call
+      this.connected = true;
+      if (this._phase === 'world') {
+        this._pingTimer = setInterval(() => this._sendPing(), ClientConfig.PING_INTERVAL_MS);
+      }
+    };
+
+    socket.onclose = () => {
+      if (this.ws !== socket) return;
+      const wasWorldPhase = this._phase === 'world';
+      this.connected = false;
+      if (this._pingTimer) {
+        clearInterval(this._pingTimer);
+        this._pingTimer = null;
+      }
+      // The gateway closes its own socket on purpose right after sending
+      // a redirect (or an error) -- that is never a "disconnect" Game
+      // needs to react to, only a dropped WORLD connection is.
+      if (wasWorldPhase && this.onWorldDisconnected) this.onWorldDisconnected();
+    };
+
+    socket.onerror = (err) => {
+      console.error('WebSocket error:', err);
+    };
+
+    socket.onmessage = (event) => {
+      if (this.ws !== socket) return;
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch (err) {
+        return;
+      }
+      this._handleMessage(msg);
+    };
+  }
+
+  _teardownSocket() {
+    if (!this.ws) return;
+    const stale = this.ws;
+    stale.onopen = stale.onclose = stale.onmessage = stale.onerror = null;
+    try {
+      stale.close();
+    } catch (err) {
+      // Already closed/closing -- fine.
+    }
+    this.ws = null;
+  }
+
+  _handleMessage(msg) {
+    switch (msg.type) {
+      case MessageTypes.S2C_REDIRECT:
+        if (this.onRedirect) this.onRedirect(msg);
+        break;
+      case MessageTypes.S2C_ASSIGNMENT_ERROR:
+        if (this.onAssignmentError) this.onAssignmentError(msg.reason);
+        break;
+      case MessageTypes.S2C_CONNECTION_INFO:
+        this.serverId = msg.serverId;
+        this.worldId = msg.worldId;
+        this.worldType = msg.worldType;
+        this.rejoinToken = msg.rejoinToken;
+        if (this.onConnectionInfo) this.onConnectionInfo(msg);
+        break;
+      case MessageTypes.S2C_WELCOME:
+        this.localId = msg.id;
+        if (this.onWelcome) this.onWelcome(msg);
+        break;
+      case MessageTypes.S2C_SNAPSHOT:
+        if (this.onSnapshot) this.onSnapshot(msg);
+        break;
+      case MessageTypes.S2C_PLAYER_JOINED:
+        if (this.onPlayerJoined) this.onPlayerJoined(msg.id);
+        break;
+      case MessageTypes.S2C_PLAYER_LEFT:
+        if (this.onPlayerLeft) this.onPlayerLeft(msg.id);
+        break;
+      case MessageTypes.S2C_REJOIN_FAILED:
+        this.rejoinToken = null;
+        if (this.onRejoinFailed) this.onRejoinFailed();
+        break;
+      case MessageTypes.S2C_PONG:
+        this.ping = performance.now() - msg.clientSendTime;
+        break;
+    }
+  }
+
+  /** Sends one tick's worth of input. Input is the ONLY thing this client ever sends about its own movement -- never a position. */
+  sendInput(input) {
+    this._send({ type: MessageTypes.C2S_INPUT, ...input });
+  }
+
+  _sendPing() {
+    this._send({ type: MessageTypes.C2S_PING, clientSendTime: performance.now() });
+  }
+
+  _send(data) {
+    if (this.connected && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(data));
+    }
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: INPUT MANAGER
+ * -------------------------------------------------------------------------
+ * Tracks raw key state and converts WASD into a normalized world-space
+ * movement direction relative to the camera's current facing -- the
+ * standard third-person-action-game control scheme ("W moves the way the
+ * camera is looking").
+ *
+ * Deliberately computed using the camera's actual world-space forward/
+ * right vectors (via THREE.Vector3 + cross product) rather than manual
+ * trigonometry on a yaw angle. That makes this code correct regardless of
+ * whatever angle convention CameraController happens to use internally --
+ * the two classes don't need to agree on a convention because this one
+ * just asks the camera object what direction it's actually facing.
+ * ========================================================================= */
+
+class InputManager {
+  constructor() {
+    this.keys = new Set();
+    window.addEventListener('keydown', (e) => this.keys.add(e.code));
+    window.addEventListener('keyup', (e) => this.keys.delete(e.code));
+  }
+
+  isDown(code) {
+    return this.keys.has(code);
+  }
+
+  /**
+   * @param {THREE.Camera} camera
+   * @returns {{x:number, z:number}} normalized world-space direction, or {0,0}
+   */
+  getMoveDirection(camera) {
+    let ix = 0;
+    let iz = 0;
+    if (this.isDown('KeyW')) iz -= 1;
+    if (this.isDown('KeyS')) iz += 1;
+    if (this.isDown('KeyA')) ix -= 1;
+    if (this.isDown('KeyD')) ix += 1;
+
+    if (ix === 0 && iz === 0) return { x: 0, z: 0 };
+
+    const forward = new THREE.Vector3();
+    camera.getWorldDirection(forward);
+    forward.y = 0;
+    forward.normalize();
+
+    const right = new THREE.Vector3().crossVectors(forward, UP_VECTOR).normalize();
+
+    const dir = new THREE.Vector3()
+      .addScaledVector(right, ix)
+      .addScaledVector(forward, -iz)
+      .normalize();
+
+    return { x: dir.x, z: dir.z };
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: CAMERA CONTROLLER
+ * -------------------------------------------------------------------------
+ * Third-person follow camera: orbits a target point (the local player)
+ * using left-mouse-drag for yaw/pitch and the scroll wheel for distance,
+ * with smoothed (lerped) following so camera motion doesn't feel rigid.
+ *
+ * Kept intentionally simple and free-standing -- no OrbitControls addon,
+ * no dependency on entity/network code -- because this is exactly the
+ * piece a future lock-on camera mode would replace or extend, and it
+ * should be easy to swap without touching rendering or input code.
+ * ========================================================================= */
+
+class CameraController {
+  constructor(camera, domElement) {
+    this.camera = camera;
+    this.domElement = domElement;
+
+    this.yaw = 0;
+    this.pitch = 0.35;
+    this.distance = 8;
+    this.height = 2.2; // vertical offset of the look-at target, roughly head height
+
+    this.minPitch = 0.05;
+    this.maxPitch = 1.3;
+    this.minDistance = 3;
+    this.maxDistance = 20;
+    this.sensitivity = 0.0025;
+    this.followLerp = 0.25;
+
+    this._dragging = false;
+
+    domElement.addEventListener('mousedown', (e) => {
+      if (e.button === 0) this._dragging = true;
+    });
+    window.addEventListener('mouseup', () => {
+      this._dragging = false;
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!this._dragging) return;
+      this.yaw -= e.movementX * this.sensitivity;
+      this.pitch -= e.movementY * this.sensitivity;
+      this.pitch = Math.max(this.minPitch, Math.min(this.maxPitch, this.pitch));
+    });
+    domElement.addEventListener(
+      'wheel',
+      (e) => {
+        this.distance = Math.max(this.minDistance, Math.min(this.maxDistance, this.distance + e.deltaY * 0.01));
+      },
+      { passive: true }
+    );
+  }
+
+  /** @param {{x:number,y:number,z:number}} targetPosition - world position to orbit around */
+  update(targetPosition) {
+    const offsetX = Math.sin(this.yaw) * Math.cos(this.pitch) * this.distance;
+    const offsetY = Math.sin(this.pitch) * this.distance;
+    const offsetZ = Math.cos(this.yaw) * Math.cos(this.pitch) * this.distance;
+
+    const desired = new THREE.Vector3(
+      targetPosition.x + offsetX,
+      targetPosition.y + this.height + offsetY,
+      targetPosition.z + offsetZ
+    );
+
+    this.camera.position.lerp(desired, this.followLerp);
+    this.camera.lookAt(targetPosition.x, targetPosition.y + this.height * 0.6, targetPosition.z);
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: ENTITY VIEW (rendering)
+ * -------------------------------------------------------------------------
+ * The visual representation of one entity. Intentionally a "dumb" class:
+ * it only knows how to build a mesh for a given entity type and move that
+ * mesh to a given transform. It has no idea whether the data driving it
+ * came from prediction or interpolation -- that separation is exactly
+ * what keeps rendering decoupled from the networking/prediction layers.
+ *
+ * Scaling note (instancing-ready): at small player counts, one
+ * THREE.Mesh per entity (as done here) is simplest and fine. Because
+ * every entity's renderable state already flows through this single
+ * class with a stable per-id lookup (see ClientEntityManager), swapping
+ * to THREE.InstancedMesh later only means changing what happens inside
+ * this class and ClientEntityManager -- nothing in Interpolator,
+ * Predictor, or NetworkManager would need to change.
+ * ========================================================================= */
+
+class EntityView {
+  constructor(scene, id, type) {
+    this.id = id;
+    this.type = type;
+    this.mesh = EntityView._createMesh(type);
+    scene.add(this.mesh);
+  }
+
+  static _createMesh(type) {
+    let geometry;
+    let color;
+
+    switch (type) {
+      case 'player':
+        geometry = new THREE.CapsuleGeometry(0.5, 1.0, 4, 8);
+        color = 0x4aa3ff;
+        break;
+      case 'enemy':
+        geometry = new THREE.BoxGeometry(1, 1, 1);
+        color = 0xff5050;
+        break;
+      default:
+        geometry = new THREE.BoxGeometry(1, 1, 1);
+        color = 0xaaaaaa;
+    }
+
+    // MeshLambertMaterial + one directional + one ambient light (see
+    // Game._setupLights) is deliberately the most expensive lighting this
+    // project uses -- no shadow maps, no PBR materials, per the
+    // "no expensive lighting" / low-poly requirement.
+    const material = new THREE.MeshLambertMaterial({ color });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+
+    // Small facing indicator on the local +Z side. Capsules/cubes have no
+    // inherent "front", so without this it's impossible to visually
+    // confirm rotation is working. Also doubles as a natural mount point
+    // for a future weapon/aim-direction indicator.
+    const indicator = new THREE.Mesh(
+      new THREE.ConeGeometry(0.15, 0.3, 6),
+      new THREE.MeshLambertMaterial({ color: 0xffffff })
+    );
+    indicator.position.set(0, 0.2, 0.55);
+    indicator.rotation.x = Math.PI / 2;
+    mesh.add(indicator);
+
+    return mesh;
+  }
+
+  updateTransform(position, rotationY) {
+    this.mesh.position.set(position.x, position.y, position.z);
+    this.mesh.rotation.y = rotationY;
+  }
+
+  dispose(scene) {
+    scene.remove(this.mesh);
+    this.mesh.traverse((obj) => {
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) obj.material.dispose();
+    });
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: CLIENT ENTITY MANAGER
+ * -------------------------------------------------------------------------
+ * Client-side counterpart to the server's EntityManager: a single place
+ * that owns "which EntityViews currently exist", keyed by entity id, so
+ * the render loop never has to guess whether a view already exists.
+ * ========================================================================= */
+
+class ClientEntityManager {
+  constructor(scene) {
+    this.scene = scene;
+    /** @type {Map<string, EntityView>} */
+    this.views = new Map();
+  }
+
+  ensureView(id, type) {
+    if (!this.views.has(id)) {
+      this.views.set(id, new EntityView(this.scene, id, type));
+    }
+    return this.views.get(id);
+  }
+
+  getView(id) {
+    return this.views.get(id);
+  }
+
+  removeView(id) {
+    const view = this.views.get(id);
+    if (view) {
+      view.dispose(this.scene);
+      this.views.delete(id);
+    }
+  }
+
+  getAllIds() {
+    return Array.from(this.views.keys());
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: INTERPOLATOR (snapshot interpolation for remote entities)
+ * -------------------------------------------------------------------------
+ * Buffers incoming snapshot samples per remote entity, keyed by the local
+ * time they were *received* (not server time -- this avoids needing any
+ * clock synchronization between client and server). Render code asks for
+ * the entity's state at "now minus INTERP_DELAY_MS", which the buffer
+ * answers by interpolating between the two real samples that bracket
+ * that moment.
+ *
+ * This is what satisfies "interpolate remote players, do not snap
+ * positions": remote players are never teleported to the latest network
+ * update -- they're always eased between two snapshots that are slightly
+ * in the past.
+ * ========================================================================= */
+
+class EntityInterpolationBuffer {
+  constructor() {
+    this.samples = []; // [{ recvTime, position:{x,y,z}, rotationY }]
+  }
+
+  pushSample(sample) {
+    this.samples.push(sample);
+    if (this.samples.length > 32) this.samples.shift(); // bound memory
+  }
+
+  sampleAt(renderTime) {
+    const s = this.samples;
+    if (s.length === 0) return null;
+    if (s.length === 1) return { position: s[0].position, rotationY: s[0].rotationY };
+
+    if (renderTime <= s[0].recvTime) {
+      return { position: s[0].position, rotationY: s[0].rotationY };
+    }
+    const last = s[s.length - 1];
+    if (renderTime >= last.recvTime) {
+      return { position: last.position, rotationY: last.rotationY };
+    }
+
+    for (let i = 0; i < s.length - 1; i++) {
+      const a = s[i];
+      const b = s[i + 1];
+      if (renderTime >= a.recvTime && renderTime <= b.recvTime) {
+        const span = b.recvTime - a.recvTime || 1;
+        const t = (renderTime - a.recvTime) / span;
+        return {
+          position: {
+            x: lerp(a.position.x, b.position.x, t),
+            y: lerp(a.position.y, b.position.y, t),
+            z: lerp(a.position.z, b.position.z, t),
+          },
+          rotationY: lerpAngle(a.rotationY, b.rotationY, t),
+        };
+      }
+    }
+    return { position: last.position, rotationY: last.rotationY };
+  }
+}
+
+class Interpolator {
+  constructor() {
+    /** @type {Map<string, EntityInterpolationBuffer>} */
+    this.buffers = new Map();
+  }
+
+  ingestSnapshot(entities, recvTime) {
+    for (const e of entities) {
+      if (!this.buffers.has(e.id)) {
+        this.buffers.set(e.id, new EntityInterpolationBuffer());
+      }
+      this.buffers.get(e.id).pushSample({ recvTime, position: e.position, rotationY: e.rotationY });
+    }
+  }
+
+  getRenderState(id, renderTime) {
+    const buffer = this.buffers.get(id);
+    return buffer ? buffer.sampleAt(renderTime) : null;
+  }
+
+  removeEntity(id) {
+    this.buffers.delete(id);
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: PREDICTOR (local player prediction + server reconciliation)
+ * -------------------------------------------------------------------------
+ * Owns the local player's predicted simulation state. Each fixed
+ * simulation step:
+ *   1. step() runs MovementSystem locally, immediately, using the same
+ *      math the server will eventually run -- this is what makes local
+ *      movement feel instant despite network latency.
+ *   2. The resulting input (with a unique sequence number) is both kept
+ *      in `pendingInputs` (for replay) and recorded in `history`
+ *      (for accurate error measurement, see reconcile()), then sent to
+ *      the server.
+ *
+ * When a snapshot arrives carrying this client's own authoritative state
+ * plus the seq the server last processed:
+ *   1. reconcile() looks up what WE predicted at that exact seq (from
+ *      `history`) and diffs it against the server's actual result --
+ *      that diff is the true prediction error, used only for the debug
+ *      "correction" readout.
+ *   2. The simulation state is re-baselined to the server's authoritative
+ *      result, then every input newer than the acknowledged seq
+ *      (everything the server hasn't confirmed yet) is replayed on top of
+ *      it via MovementSystem, bringing the prediction back to "now".
+ *
+ * Visual smoothing: `visualPosition` is a separate, slower-moving copy of
+ * `state.position` that the renderer actually draws. Even when
+ * reconciliation snaps `state.position` to a corrected value, the
+ * rendered mesh eases toward it (see updateVisual) rather than jumping --
+ * this is the "reconciliation corrects drift smoothly" requirement.
+ * ========================================================================= */
+
+class Predictor {
+  constructor(movementConfig) {
+    this.cfg = movementConfig;
+
+    this.state = {
+      position: { x: 0, y: 0, z: 0 },
+      velocity: { x: 0, y: 0, z: 0 },
+      rotationY: 0,
+      movementState: 'idle',
+    };
+    this.visualPosition = { x: 0, y: 0, z: 0 };
+
+    this.pendingInputs = []; // inputs sent but not yet acknowledged by the server
+    this.history = [];       // [{seq, position}] our own predicted position right after each step
+
+    this.seqCounter = 0;
+    this.lastCorrectionAmount = 0;
+  }
+
+  setSpawn(position, rotationY) {
+    this.state.position = { ...position };
+    this.visualPosition = { ...position };
+    this.state.rotationY = rotationY || 0;
+  }
+
+  /**
+   * Runs one fixed simulation step locally and returns the input command
+   * that should be sent to the server.
+   */
+  step(dirX, dirZ, dt) {
+    this.seqCounter++;
+    const input = { seq: this.seqCounter, dirX, dirZ };
+
+    MovementSystem.step(this.state, input, dt, this.cfg);
+
+    this.pendingInputs.push(input);
+    this.history.push({ seq: input.seq, position: { ...this.state.position } });
+
+    // Bound memory in case of a long disconnect/stall.
+    if (this.pendingInputs.length > 256) this.pendingInputs.shift();
+    if (this.history.length > 256) this.history.shift();
+
+    return input;
+  }
+
+  /**
+   * @param {{position, velocity, rotationY}} serverState - this client's
+   *   own authoritative entity state, taken from the latest snapshot.
+   * @param {number} lastProcessedSeq - the input seq the server has
+   *   incorporated as of this snapshot.
+   */
+  reconcile(serverState, lastProcessedSeq) {
+    const historical = this.history.find((h) => h.seq === lastProcessedSeq);
+    if (historical) {
+      this.lastCorrectionAmount = Math.hypot(
+        serverState.position.x - historical.position.x,
+        serverState.position.z - historical.position.z
+      );
+    }
+
+    // Acknowledged inputs/history are no longer needed.
+    this.pendingInputs = this.pendingInputs.filter((i) => i.seq > lastProcessedSeq);
+    this.history = this.history.filter((h) => h.seq > lastProcessedSeq);
+
+    // Re-baseline on the server's authoritative result...
+    this.state.position = { ...serverState.position };
+    this.state.velocity = { ...serverState.velocity };
+    this.state.rotationY = serverState.rotationY;
+
+    // ...then replay every input the server hasn't confirmed yet to catch
+    // back up to "now". Each replayed input needs a timestep -- we use
+    // the client's own fixed simulation dt, since that's what every
+    // pending input was originally generated with.
+    const dt = 1 / ServerTickRate;
+    for (const input of this.pendingInputs) {
+      MovementSystem.step(this.state, input, dt, this.cfg);
+    }
+  }
+
+  /** Eases the rendered position toward the simulated position. Call once per render frame. */
+  updateVisual(dt) {
+    const t = 1 - Math.pow(ClientConfig.VISUAL_SMOOTHING, dt);
+    this.visualPosition.x += (this.state.position.x - this.visualPosition.x) * t;
+    this.visualPosition.y += (this.state.position.y - this.visualPosition.y) * t;
+    this.visualPosition.z += (this.state.position.z - this.visualPosition.z) * t;
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: DEBUG UI
+ * -------------------------------------------------------------------------
+ * Extended for the multi-instance architecture: alongside the original
+ * fps/tick/correction readout, this now surfaces exactly the identity and
+ * capacity info the architecture brief calls for -- which gateway/server/
+ * world this client landed on, and that world's live population/entity
+ * count/measured tick rate, all of which only exist because worlds are
+ * now dynamic and plural instead of "the one server you're talking to".
+ * ========================================================================= */
+
+class DebugUI {
+  constructor(element) {
+    this.element = element;
+  }
+
+  update(stats) {
+    this.element.textContent =
+      `Gateway:   ${stats.gatewayStatus}\n` +
+      `Server:    ${stats.serverId || '--'}\n` +
+      `World:     ${stats.worldId || '--'}${stats.worldType ? ' (' + stats.worldType + ')' : ''}\n` +
+      `Players:   ${stats.playerCount}/${stats.capacity || '--'}\n` +
+      `Entities:  ${stats.entityCount}\n` +
+      `Ping:      ${stats.ping.toFixed(0)} ms\n` +
+      `TPS:       ${stats.tps ? stats.tps.toFixed(0) : '--'}\n` +
+      `\n` +
+      `fps:         ${stats.fps.toFixed(0)}\n` +
+      `server tick: ${stats.tick}\n` +
+      `correction:  ${stats.correction.toFixed(3)} m`;
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: LOADING SCREEN
+ * -------------------------------------------------------------------------
+ * A tiny, deliberately generic overlay. Today the only thing it ever
+ * narrates is the gateway -> world handoff (see Game._setStage), which
+ * normally completes in well under a second. It's built as a standalone
+ * component specifically so a future, genuinely slow loading sequence
+ * (streaming a destination's assets, say) can reuse setMessage/show/hide
+ * without anything about the connection-handling code needing to change.
+ * ========================================================================= */
+
+class LoadingScreen {
+  constructor(element, messageElement) {
+    this.element = element;
+    this.messageElement = messageElement;
+  }
+
+  show() {
+    this.element.classList.remove('hidden');
+  }
+
+  hide() {
+    this.element.classList.add('hidden');
+  }
+
+  setMessage(text, isError) {
+    this.messageElement.textContent = text;
+    this.messageElement.className = isError ? 'loading-error' : 'loading-message';
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: GAME (bootstrap + main loop)
+ * -------------------------------------------------------------------------
+ * Ties every module above together. This is intentionally the only class
+ * that knows about all the others -- the same role server.js plays on
+ * the backend.
+ *
+ * Two distinct loops, run from one requestAnimationFrame callback:
+ *   - Render loop: runs every rAF call, naturally tracking the display's
+ *     refresh rate (~60fps on most monitors). Handles visual smoothing,
+ *     remote-entity interpolation, camera, and the actual draw call.
+ *   - Fixed-timestep simulation loop: a classic accumulator pattern
+ *     nested inside the render loop. However fast or slow frames arrive,
+ *     Predictor.step() is always called with the SAME dt (1 / ServerTickRate),
+ *     keeping client prediction math deterministic and in lockstep with
+ *     the server's own fixed-tick simulation -- exactly as required by
+ *     "Client simulation: fixed timestep" / "delta time independent".
+ * ========================================================================= */
+
+class Game {
+  constructor() {
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x202030);
+    this.scene.fog = new THREE.Fog(0x202030, 25, 70);
+
+    this.camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 500);
+
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(this.renderer.domElement);
+
+    this._setupLights();
+    this._setupGround();
+
+    this.cameraController = new CameraController(this.camera, this.renderer.domElement);
+    this.input = new InputManager();
+    this.network = new NetworkManager();
+    this.entityManager = new ClientEntityManager(this.scene);
+    this.interpolator = new Interpolator();
+    this.predictor = null; // created once we know our spawn, in onWelcome
+
+    this.localId = null;
+    this.lastSnapshotTick = 0;
+    this.connectedPlayerCount = 0;
+    this.entityCount = 0;
+    this.worldCapacity = null;
+    this.measuredTps = null;
+
+    // Gateway/world identity, for the debug UI -- see the architecture
+    // brief's "Server Identification" / "Debug UI" sections.
+    this.gatewayStatus = 'connecting';
+    this.serverId = null;
+    this.worldId = null;
+    this.worldType = null;
+
+    // World-transfer bookkeeping (see _handleRedirect / _handleWorldDisconnected).
+    // `pendingAssignment` is whatever the gateway last told us, kept around
+    // so an unexpected drop of the WORLD connection can retry directly
+    // against the same (server, world) before falling back to asking the
+    // gateway all over again.
+    this.pendingAssignment = null;
+    this.reconnectAttempts = 0;
+    this._reconnectTimer = null;
+
+    this.debugUI = new DebugUI(document.getElementById('debug-ui'));
+    this.statusEl = document.getElementById('connection-status');
+    this.loadingScreen = new LoadingScreen(
+      document.getElementById('loading-screen'),
+      document.getElementById('loading-message')
+    );
+
+    this._fixedDt = 1 / 30; // overwritten once the server's welcome message arrives
+    this._accumulator = 0;
+    this._lastFrameTime = performance.now();
+
+    this._fpsFrameCount = 0;
+    this._fpsTimer = 0;
+    this._fps = 0;
+
+    this._wireNetworkEvents();
+
+    window.addEventListener('resize', () => {
+      this.camera.aspect = window.innerWidth / window.innerHeight;
+      this.camera.updateProjectionMatrix();
+      this.renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  }
+
+  _setupLights() {
+    // One ambient + one directional light, no shadow maps. This is the
+    // ceiling on lighting cost for this project, per the "no expensive
+    // lighting" / low-poly requirement.
+    this.scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const directional = new THREE.DirectionalLight(0xffffff, 0.6);
+    directional.position.set(5, 10, 5);
+    this.scene.add(directional);
+  }
+
+  _setupGround() {
+    // Single flat plane for the whole world today. Chunk-ready in the
+    // sense that nothing else in the renderer assumes a single ground
+    // mesh -- swapping this for a tiled/streamed terrain system later
+    // would not require touching EntityView, ClientEntityManager, or the
+    // camera/input code.
+    const geometry = new THREE.PlaneGeometry(WorldBounds * 2, WorldBounds * 2, 1, 1);
+    const material = new THREE.MeshLambertMaterial({ color: 0x33333f });
+    const ground = new THREE.Mesh(geometry, material);
+    ground.rotation.x = -Math.PI / 2;
+    this.scene.add(ground);
+
+    this.scene.add(new THREE.GridHelper(WorldBounds * 2, 20, 0x55556a, 0x44445a));
+  }
+
+  _wireNetworkEvents() {
+    this.network.onRedirect = (assignment) => this._handleRedirect(assignment);
+    this.network.onAssignmentError = (reason) => this._handleAssignmentError(reason);
+    this.network.onConnectionInfo = (msg) => this._handleConnectionInfo(msg);
+    this.network.onWelcome = (msg) => this._handleWelcome(msg);
+    this.network.onSnapshot = (msg) => this._applySnapshot(msg);
+    this.network.onPlayerLeft = (id) => {
+      this.entityManager.removeView(id);
+      this.interpolator.removeEntity(id);
+    };
+    this.network.onRejoinFailed = () => {
+      // Grace period expired / token unknown server-side -- nothing to
+      // recover, the next message will be a fresh S2C_WELCOME instead.
+      console.warn('Rejoin failed; joining as a new player.');
+    };
+    this.network.onWorldDisconnected = () => this._handleWorldDisconnected();
+  }
+
+  /** Centralizes the loading-overlay + top-right status text for every phase of the connection lifecycle. */
+  _setStage(stage, detail) {
+    this.stage = stage;
+    switch (stage) {
+      case 'CONNECTING_GATEWAY':
+        this.gatewayStatus = 'connecting';
+        this.loadingScreen.show();
+        this.loadingScreen.setMessage('Connecting to gateway…');
+        this.statusEl.textContent = 'connecting to gateway...';
+        break;
+      case 'CONNECTING_WORLD':
+        this.loadingScreen.show();
+        this.loadingScreen.setMessage(detail || 'Connecting to world…');
+        this.statusEl.textContent = 'connecting to world...';
+        break;
+      case 'RECONNECTING':
+        this.loadingScreen.show();
+        this.loadingScreen.setMessage(detail || 'Reconnecting…');
+        this.statusEl.textContent = 'reconnecting...';
+        break;
+      case 'IN_WORLD':
+        this.gatewayStatus = 'connected';
+        this.loadingScreen.hide();
+        break;
+      case 'ERROR':
+        this.loadingScreen.show();
+        this.loadingScreen.setMessage(detail || 'Connection error.', true);
+        this.statusEl.textContent = 'error';
+        break;
+    }
+  }
+
+  _handleRedirect(assignment) {
+    this.pendingAssignment = assignment;
+    this.serverId = assignment.serverId;
+    this.worldId = assignment.worldId;
+    this.worldType = assignment.worldType;
+    this.reconnectAttempts = 0;
+
+    this._setStage('CONNECTING_WORLD', `Entering ${assignment.worldType} (${assignment.worldId})…`);
+    this.network.connectToWorld(assignment.wsUrl, assignment.worldId);
+  }
+
+  _handleAssignmentError(reason) {
+    this._setStage('ERROR', reason || 'No world server currently has room.');
+  }
+
+  _handleConnectionInfo(msg) {
+    this.serverId = msg.serverId;
+    this.worldId = msg.worldId;
+    this.worldType = msg.worldType;
+    // Remember exactly enough to retry a direct reconnect later without
+    // going through the gateway again (see _handleWorldDisconnected).
+    this.pendingAssignment = {
+      serverId: msg.serverId,
+      worldId: msg.worldId,
+      worldType: msg.worldType,
+      wsUrl: this.network.ws ? this.network.ws.url.split('?')[0] : this.pendingAssignment?.wsUrl,
+    };
+  }
+
+  /**
+   * Called whenever the WORLD connection drops unexpectedly (never for
+   * the gateway's own intentional post-redirect close). First retries a
+   * few times directly against the same world+rejoin token (cheap, and
+   * resumes the exact same entity within the server's grace window);
+   * if that's exhausted, falls all the way back to asking the gateway
+   * for a brand new assignment.
+   */
+  _handleWorldDisconnected() {
+    if (this._reconnectTimer) return; // already scheduled
+    if (!this.pendingAssignment) {
+      this._setStage('ERROR', 'Lost connection to the world server.');
+      return;
+    }
+
+    this.reconnectAttempts++;
+    if (this.reconnectAttempts > ClientConfig.MAX_DIRECT_RECONNECT_ATTEMPTS) {
+      this._setStage('RECONNECTING', 'Lost connection — finding a new world…');
+      this.reconnectAttempts = 0;
+      this.network.rejoinToken = null;
+      this._reconnectTimer = setTimeout(() => {
+        this._reconnectTimer = null;
+        this._setStage('CONNECTING_GATEWAY');
+        this.network.connectToGateway(ClientConfig.GATEWAY_URL, this.worldType || REQUESTED_WORLD_TYPE);
+      }, ClientConfig.RECONNECT_BASE_DELAY_MS);
+      return;
+    }
+
+    const delay = ClientConfig.RECONNECT_BASE_DELAY_MS * Math.pow(2, this.reconnectAttempts - 1);
+    this._setStage('RECONNECTING', `Reconnecting (attempt ${this.reconnectAttempts})…`);
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      const { wsUrl, worldId } = this.pendingAssignment;
+      this.network.connectToWorld(wsUrl, worldId, this.network.rejoinToken);
+    }, delay);
+  }
+
+  /**
+   * Clears every piece of client-side state that's scoped to "the world
+   * we were just in" -- entity views, interpolation buffers, and the
+   * predictor. Worlds are fully isolated server-side; this is what keeps
+   * them isolated on the client too, so a transfer (or a reconnect that
+   * lands in a different world) never leaves a stale entity rendering
+   * from the world we just left. Safe to call on the very first connect,
+   * when there's nothing yet to clear.
+   */
+  _resetForNewWorld() {
+    for (const id of this.entityManager.getAllIds()) {
+      this.entityManager.removeView(id);
+    }
+    this.interpolator = new Interpolator();
+    this.predictor = null;
+    this.lastSnapshotTick = 0;
+    this.connectedPlayerCount = 0;
+    this.entityCount = 0;
+  }
+
+  _handleWelcome(msg) {
+    // Worlds are isolated server-side; this is what keeps a transfer (or
+    // a reconnect that lands in a different world) from rendering any
+    // leftover entity from whatever we were just in.
+    this._resetForNewWorld();
+
+    this.localId = msg.id;
+    this.serverId = msg.serverId;
+    this.worldId = msg.worldId;
+    this.worldType = msg.worldType;
+    this.worldCapacity = msg.capacity;
+    this.reconnectAttempts = 0;
+
+    // Adopt the server's authoritative tuning values -- see the CONFIG
+    // section header comment for why this matters.
+    MovementConfig = msg.config.movement;
+    ServerTickRate = msg.config.serverTickRate;
+    SnapshotRate = msg.config.snapshotRate;
+    WorldBounds = msg.config.worldBounds;
+    this._fixedDt = 1 / ServerTickRate;
+
+    this.predictor = new Predictor(MovementConfig);
+
+    const localEntity = msg.snapshot.entities.find((e) => e.id === this.localId);
+    if (localEntity) {
+      this.predictor.setSpawn(localEntity.position, localEntity.rotationY);
+    }
+    this.entityManager.ensureView(this.localId, 'player');
+
+    this.statusEl.textContent = `connected (${this.localId.slice(0, 8)}) — ${this.worldId}`;
+    this._setStage('IN_WORLD');
+
+    // Rebuild the ground/world-bounds-dependent visuals now that we know
+    // the real WorldBounds value (constructor used the placeholder default).
+    this._setupGround();
+
+    this._applySnapshot(msg.snapshot);
+  }
+
+  _applySnapshot(snapshot) {
+    this.lastSnapshotTick = snapshot.tick;
+    this.connectedPlayerCount = Object.keys(snapshot.players || {}).length;
+    this.entityCount = snapshot.entities.length;
+    this.worldCapacity = snapshot.capacity ?? this.worldCapacity;
+    this.measuredTps = snapshot.tps;
+    // serverId/worldId/worldType normally arrive earlier via
+    // S2C_CONNECTION_INFO, but the snapshot carries them too (see
+    // world/SnapshotManager.js) -- harmless to keep them in lockstep here.
+    this.serverId = snapshot.serverId || this.serverId;
+    this.worldId = snapshot.worldId || this.worldId;
+    this.worldType = snapshot.worldType || this.worldType;
+
+    const remoteEntities = [];
+    for (const entity of snapshot.entities) {
+      if (entity.id === this.localId) {
+        // Our own authoritative state -- feed it to the predictor's
+        // reconciliation step rather than rendering it directly.
+        const ack = snapshot.players?.[this.localId]?.lastProcessedInputSeq;
+        if (this.predictor && ack !== undefined) {
+          this.predictor.reconcile(entity, ack);
+        }
+      } else {
+        remoteEntities.push(entity);
+        this.entityManager.ensureView(entity.id, entity.type);
+      }
+    }
+
+    this.interpolator.ingestSnapshot(remoteEntities, performance.now());
+  }
+
+  start() {
+    this._setStage('CONNECTING_GATEWAY');
+    this.network.connectToGateway(ClientConfig.GATEWAY_URL, REQUESTED_WORLD_TYPE);
+    requestAnimationFrame((t) => this._loop(t));
+  }
+
+  _loop(now) {
+    requestAnimationFrame((t) => this._loop(t));
+
+    // Clamp huge frame gaps (e.g. returning to a backgrounded tab) so the
+    // accumulator doesn't try to "catch up" by running hundreds of
+    // simulation steps in one frame.
+    const frameDt = Math.min((now - this._lastFrameTime) / 1000, 0.1);
+    this._lastFrameTime = now;
+
+    // ---- Fixed-timestep simulation/prediction ----------------------------
+    this._accumulator += frameDt;
+    while (this._accumulator >= this._fixedDt) {
+      this._tickSimulation(this._fixedDt);
+      this._accumulator -= this._fixedDt;
+    }
+
+    // ---- Local player: visual smoothing + camera --------------------------
+    if (this.predictor) {
+      this.predictor.updateVisual(frameDt);
+      const localView = this.entityManager.getView(this.localId);
+      if (localView) {
+        localView.updateTransform(this.predictor.visualPosition, this.predictor.state.rotationY);
+      }
+      this.cameraController.update(this.predictor.visualPosition);
+    }
+
+    // ---- Remote players: snapshot interpolation ----------------------------
+    const renderTime = performance.now() - ClientConfig.INTERP_DELAY_MS;
+    for (const id of this.entityManager.getAllIds()) {
+      if (id === this.localId) continue;
+      const renderState = this.interpolator.getRenderState(id, renderTime);
+      if (renderState) {
+        this.entityManager.getView(id).updateTransform(renderState.position, renderState.rotationY);
+      }
+    }
+
+    this.renderer.render(this.scene, this.camera);
+    this._updateDebugUI(frameDt);
+  }
+
+  _tickSimulation(dt) {
+    if (!this.predictor) return;
+    const direction = this.input.getMoveDirection(this.camera);
+    const input = this.predictor.step(direction.x, direction.z, dt);
+    this.network.sendInput(input);
+  }
+
+  _updateDebugUI(frameDt) {
+    this._fpsFrameCount++;
+    this._fpsTimer += frameDt;
+    if (this._fpsTimer >= 0.5) {
+      this._fps = this._fpsFrameCount / this._fpsTimer;
+      this._fpsFrameCount = 0;
+      this._fpsTimer = 0;
+    }
+
+    this.debugUI.update({
+      gatewayStatus: this.gatewayStatus,
+      serverId: this.serverId,
+      worldId: this.worldId,
+      worldType: this.worldType,
+      capacity: this.worldCapacity,
+      playerCount: this.connectedPlayerCount,
+      entityCount: this.entityCount,
+      ping: this.network.ping,
+      tps: this.measuredTps,
+      tick: this.lastSnapshotTick,
+      fps: this._fps,
+      correction: this.predictor ? this.predictor.lastCorrectionAmount : 0,
+    });
+  }
+}
+
+
+/* =========================================================================
+ * SECTION: UTILITIES
+ * ========================================================================= */
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function lerpAngle(a, b, t) {
+  let diff = b - a;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  return a + diff * t;
+}
+
+/**
+ * Appends a query string to a base ws(s):// URL, tolerating a base that
+ * already ends in a slash (gateway/world servers both advertise bare
+ * `ws://host:port` URLs with no path).
+ */
+function buildWsUrl(base, params) {
+  const qs = new URLSearchParams(params).toString();
+  const sep = base.endsWith('/') ? '' : '/';
+  return qs ? `${base}${sep}?${qs}` : `${base}${sep}`;
+}
+
+
+/* =========================================================================
+ * BOOTSTRAP
+ * ========================================================================= */
+
+const game = new Game();
+game.start();
+</script>
+</body>
+</html>
