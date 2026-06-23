@@ -1,0 +1,48 @@
+# render.yaml — Render Blueprint
+# ---------------------------------------------------------------------------
+# Deploys the gateway + one world server as two separate Render web
+# services. In the Render Dashboard: New + → Blueprint → select this repo.
+#
+# Both service public URLs are deterministic from their `name` field
+# (https://<name>.onrender.com) *as long as that name isn't already taken
+# by someone else on Render* — if Render has to append a disambiguating
+# suffix, open blade-world-fra-01's Environment tab afterward and update
+# GATEWAY_URL to match the gateway's actual assigned URL, then redeploy.
+#
+# `plan: free` spins down after 15 minutes of inactivity (~1 min cold
+# start on the next connection). Switch both services to `plan: starter`
+# (or higher) for an always-on deployment.
+#
+# To add a second world server instance later (e.g. for load spreading or
+# a dedicated PvP server), copy the blade-world-fra-01 block, give it a
+# new `name` and a different SERVER_ID — everything else about the
+# gateway and the existing world server stays untouched.
+# ---------------------------------------------------------------------------
+services:
+  - type: web
+    name: blade-gateway
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm run gateway
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+
+  - type: web
+    name: blade-world-fra-01
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm run world
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: SERVER_ID
+        value: FRA-01
+      # Must match blade-gateway's actual public URL (see note above).
+      - key: GATEWAY_URL
+        value: https://blade-gateway.onrender.com
+      # Nothing else to set: RENDER_EXTERNAL_URL is provided automatically
+      # by Render and picked up by world/WorldServer.js to advertise this
+      # instance's own public wss:// URL to clients.
