@@ -162,7 +162,7 @@ import * as THREE from 'three';
  * gateway (e.g. behind a CDN) and need to point at a gateway on a
  * different host.
  */
-const HARDCODED_GATEWAY_URL = '';
+const HARDCODED_GATEWAY_URL = 'https://blade-of-the-void-gateway-backend.onrender.com/';
 
 const ClientConfig = {
   GATEWAY_URL: HARDCODED_GATEWAY_URL || (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host,
@@ -617,21 +617,23 @@ class CameraController {
 
 class EntityView {
   constructor(scene, id, type) {
-    this.id = id;
-    this.type = type;
-    this.mesh = EntityView._createMesh(type);
+    this.id            = id;
+    this.type          = type;
+    this.mesh          = EntityView._createMesh(type);
+    this._prevPos      = null;   // last-frame position for speed estimation
+    this._moveSpeed    = 0;      // smoothed per-frame movement speed
+    this._walkPhase    = 0;      // walk-cycle phase accumulator (radians)
+    this._lastAnimTime = null;   // timestamp of last _animateDeadStar call
     scene.add(this.mesh);
   }
 
   static _createMesh(type) {
+    // Player gets the full Dead Star build; other types use simple geometry.
+    if (type === 'player') return EntityView._buildDeadStar();
+
     let geometry;
     let color;
-
     switch (type) {
-      case 'player':
-        geometry = new THREE.CapsuleGeometry(0.5, 1.0, 4, 8);
-        color = 0x4aa3ff;
-        break;
       case 'enemy':
         geometry = new THREE.BoxGeometry(1, 1, 1);
         color = 0xff5050;
@@ -650,10 +652,7 @@ class EntityView {
     mesh.castShadow = false;
     mesh.receiveShadow = false;
 
-    // Small facing indicator on the local +Z side. Capsules/cubes have no
-    // inherent "front", so without this it's impossible to visually
-    // confirm rotation is working. Also doubles as a natural mount point
-    // for a future weapon/aim-direction indicator.
+    // Small facing indicator on the local +Z side.
     const indicator = new THREE.Mesh(
       new THREE.ConeGeometry(0.15, 0.3, 6),
       new THREE.MeshLambertMaterial({ color: 0xffffff })
@@ -665,9 +664,214 @@ class EntityView {
     return mesh;
   }
 
+  /* -----------------------------------------------------------------------
+   * _buildDeadStar()
+   * -----------------------------------------------------------------------
+   * Constructs the "Dead Star" player avatar from primitive Three.js
+   * geometries arranged in a THREE.Group hierarchy.
+   *
+   * Design brief:
+   *   - Humanoid, ~7.5 heads tall, narrow waist, broad upper body
+   *   - Longer forearms; arms slightly angled in an A-pose
+   *   - Head: two-layer glowing sphere (bright core + dark transparent shell)
+   *   - Torso: hexagonal prism with subtle seam lines
+   *   - Hands: 3 fingers, no thumb
+   *   - Legs: slight reverse taper on shin, big feet for combat stability
+   *
+   * The root Group's origin sits at roughly hip/centre-of-mass height
+   * (y = 0), matching the coordinate convention of the original capsule.
+   * Total figure spans approximately y = -1.25 (foot sole) to y = +1.04
+   * (top of head shell), giving ~2.3 units of total height.
+   *
+   * Returns a THREE.Group so all child geometries are disposed cleanly
+   * by EntityView.dispose() via mesh.traverse().
+   * ----------------------------------------------------------------------- */
+  static _buildDeadStar() {
+    const root = new THREE.Group();
+
+    // ── Palette ────────────────────────────────────────────────────────────
+    const C_BODY  = 0x0d0618;   // near-black dark purple — "armor of night"
+    const C_ACNT  = 0x1b0d30;   // slightly lighter for extremities
+    const C_SEAM  = 0x2a0e4e;   // chest seam lines (very subtle)
+    const C_JOINT = 0x221040;   // elbow / knee / shoulder joint caps
+    const C_SHELL = 0x4a0f80;   // head outer shell: dark purple
+    const C_CORE  = 0xd050ff;   // head inner core: bright purple
+
+    // ── Materials ──────────────────────────────────────────────────────────
+    const bodyMat  = new THREE.MeshLambertMaterial({ color: C_BODY  });
+    const acntMat  = new THREE.MeshLambertMaterial({ color: C_ACNT  });
+    const jointMat = new THREE.MeshLambertMaterial({ color: C_JOINT });
+    const seamMat  = new THREE.LineBasicMaterial(  { color: C_SEAM  });
+    const shellMat = new THREE.MeshLambertMaterial({ color: C_SHELL, transparent: true, opacity: 0.68 });
+    const coreMat  = new THREE.MeshBasicMaterial(  { color: C_CORE  });
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+    /** Attach a Mesh to a parent group at a local position. */
+    const mk = (geo, mat, parent, x = 0, y = 0, z = 0) => {
+      const m = new THREE.Mesh(geo, mat);
+      m.castShadow = m.receiveShadow = false;
+      m.position.set(x, y, z);
+      parent.add(m);
+      return m;
+    };
+    /** Create a Group as a joint pivot; origin = joint world position. */
+    const grp = (parent, x = 0, y = 0, z = 0) => {
+      const g = new THREE.Group();
+      g.position.set(x, y, z);
+      parent.add(g);
+      return g;
+    };
+
+    // ── HEAD ───────────────────────────────────────────────────────────────
+    mk(new THREE.SphereGeometry(0.110, 14, 14), coreMat,  root, 0, 0.88, 0);  // glowing core
+    mk(new THREE.SphereGeometry(0.165, 18, 18), shellMat, root, 0, 0.88, 0);  // transparent shell
+
+    // ── NECK ───────────────────────────────────────────────────────────────
+    // Bottom (y = 0.66) sits flush on the chest top; top embeds in head sphere.
+    mk(new THREE.CylinderGeometry(0.054, 0.060, 0.14, 6), bodyMat, root, 0, 0.73, 0);
+
+    // ── CHEST ──────────────────────────────────────────────────────────────
+    // CylinderGeometry(6 segments) = hexagonal prism per the brief.
+    // Scaling the group wider in X and shallower in Z turns the tube into a
+    // chest-plate: the single most important change for a humanoid silhouette.
+    const chestGrp = grp(root, 0, 0.45, 0);
+    chestGrp.scale.set(1.3, 1.0, 0.72);
+    const chestGeo = new THREE.CylinderGeometry(0.24, 0.18, 0.42, 6);
+    mk(chestGeo, bodyMat, chestGrp);
+    chestGrp.add(new THREE.LineSegments(new THREE.EdgesGeometry(chestGeo), seamMat));
+
+    // ── SHOULDER CAPS ──────────────────────────────────────────────────────
+    // Visible ball-joint markers at the arm attachment points.
+    // These are THE humanoid read — the eye immediately sees "shoulders".
+    const sbGeo = new THREE.SphereGeometry(0.073, 8, 8);
+    mk(sbGeo, jointMat, root, -0.32, 0.60, 0);
+    mk(sbGeo, jointMat, root,  0.32, 0.60, 0);
+
+    // ── ABDOMEN ────────────────────────────────────────────────────────────
+    // Short, narrow connector — creates the waist cinch between chest and hips.
+    mk(new THREE.CylinderGeometry(0.120, 0.132, 0.16, 6), bodyMat, root, 0, 0.13, 0);
+
+    // ── PELVIS ─────────────────────────────────────────────────────────────
+    mk(new THREE.CylinderGeometry(0.178, 0.178, 0.16, 6), bodyMat, root, 0, -0.05, 0);
+
+    // ── SHARED GEOMETRY ────────────────────────────────────────────────────
+    const jCapGeo  = new THREE.SphereGeometry(0.062, 8, 8);  // elbow cap
+    const kCapGeo  = new THREE.SphereGeometry(0.072, 8, 8);  // knee cap
+    const uArmGeo  = new THREE.CylinderGeometry(0.055, 0.046, 0.44, 6);
+    const fArmGeo  = new THREE.CylinderGeometry(0.041, 0.035, 0.50, 6);
+    const palmGeo  = new THREE.BoxGeometry(0.090, 0.072, 0.090);
+    const fngGeo   = new THREE.CylinderGeometry(0.011, 0.008, 0.090, 4);
+    const thighGeo = new THREE.CylinderGeometry(0.086, 0.072, 0.54, 6);
+    const shinGeo  = new THREE.CylinderGeometry(0.062, 0.083, 0.46, 6);  // reverse taper
+    const footGeo  = new THREE.BoxGeometry(0.22, 0.073, 0.29);
+
+    // ── ARM SETUP ──────────────────────────────────────────────────────────
+    // Two-bone chain rooted at a shoulder pivot Group.
+    //
+    //   shoulder pivot   (world: ±0.32, 0.58)
+    //     └─ upper arm mesh    (local: y = -0.22)
+    //     └─ elbow pivot       (local: y = -0.44)  ← animation target
+    //          └─ elbow cap sphere
+    //          └─ forearm mesh  (local: y = -0.25)
+    //          └─ wrist pivot   (local: y = -0.50)
+    //               └─ palm + 3 fingers
+    //
+    // rotation.z = side * UA_TILT gives the A-pose outward lean.
+    // rotation.x is driven by _animateDeadStar() every frame.
+
+    const UA_TILT = Math.PI / 9;  // 20° A-pose outward spread
+
+    const setupArm = (sh) => {
+      mk(uArmGeo, bodyMat,  sh, 0, -0.22, 0);
+      const elbow = grp(sh, 0, -0.44, 0);
+      mk(jCapGeo,  jointMat, elbow);
+      mk(fArmGeo,  bodyMat,  elbow, 0, -0.25, 0);
+      const wrist = grp(elbow, 0, -0.50, 0);
+      mk(palmGeo, acntMat, wrist, 0, -0.036, 0);
+      for (let f = -1; f <= 1; f++) mk(fngGeo, acntMat, wrist, f * 0.023, -0.126, 0);
+    };
+
+    const leftShoulder  = grp(root, -0.32, 0.58, 0);
+    const rightShoulder = grp(root,  0.32, 0.58, 0);
+    leftShoulder.rotation.z  = -UA_TILT;
+    rightShoulder.rotation.z =  UA_TILT;
+    setupArm(leftShoulder);
+    setupArm(rightShoulder);
+
+    // ── LEG SETUP ──────────────────────────────────────────────────────────
+    // Two-bone chain rooted at a hip pivot Group.
+    //
+    //   hip pivot        (world: ±0.12, -0.13)
+    //     └─ thigh mesh       (local: y = -0.27)
+    //     └─ knee pivot       (local: y = -0.54)  ← animation target
+    //          └─ kneecap sphere
+    //          └─ shin mesh   (local: y = -0.23, reverse taper)
+    //          └─ foot mesh   (local: y = -0.497, z = +0.07 forward)
+    //
+    // rotation.x on hip drives leg swing; rotation.x on knee drives bend.
+
+    const setupLeg = (hp) => {
+      mk(thighGeo, bodyMat, hp, 0, -0.27, 0);
+      const knee = grp(hp, 0, -0.54, 0);
+      mk(kCapGeo,  jointMat, knee);
+      mk(shinGeo,  bodyMat,  knee, 0, -0.23, 0);
+      mk(footGeo,  acntMat,  knee, 0, -0.497, 0.07);
+      return knee;
+    };
+
+    const leftHip  = grp(root, -0.12, -0.13, 0);
+    const rightHip = grp(root,  0.12, -0.13, 0);
+    const leftKnee  = setupLeg(leftHip);
+    const rightKnee = setupLeg(rightHip);
+
+    // ── JOINT REFS ─────────────────────────────────────────────────────────
+    // Stored on the root Group so _animateDeadStar() can drive them each frame.
+    root._joints = { leftShoulder, rightShoulder, leftHip, rightHip, leftKnee, rightKnee };
+
+    return root;
+  }
+
+
   updateTransform(position, rotationY) {
-    this.mesh.position.set(position.x, position.y, position.z);
+    if (this._prevPos !== null) {
+      const dx = position.x - this._prevPos.x;
+      const dz = position.z - this._prevPos.z;
+      const raw = Math.sqrt(dx * dx + dz * dz);
+      this._moveSpeed = this._moveSpeed * 0.82 + raw * 0.18;
+    }
+    this._prevPos = { x: position.x, z: position.z };
+
+    // The Dead Star's root origin is at hip level; feet reach y ≈ -1.20.
+    // The server's y=0 is the ground plane, so lift the mesh so feet sit
+    // flush on the floor. Non-Dead-Star entities use no offset.
+    const yOff = this.mesh._joints ? 1.20 : 0;
+    this.mesh.position.set(position.x, position.y + yOff, position.z);
     this.mesh.rotation.y = rotationY;
+
+    if (this.mesh._joints) this._animateDeadStar();
+  }
+
+  _animateDeadStar() {
+    const j   = this.mesh._joints;
+    const now = performance.now() * 0.001;
+    const dt  = Math.min(now - (this._lastAnimTime !== null ? this._lastAnimTime : now), 0.05);
+    this._lastAnimTime = now;
+
+    this._walkPhase = (this._walkPhase + dt * (4.5 + this._moveSpeed * 15)) % (Math.PI * 2);
+
+    const legAmp  = Math.min(this._moveSpeed * 7,  0.50);
+    const armAmp  = legAmp * 0.35;
+    const kneeAmp = legAmp * 0.75;
+    const cycle   = Math.sin(this._walkPhase);
+
+    j.leftHip.rotation.x  =  cycle * legAmp;
+    j.rightHip.rotation.x = -cycle * legAmp;
+
+    j.leftKnee.rotation.x  = Math.max(0, -cycle) * kneeAmp;
+    j.rightKnee.rotation.x = Math.max(0,  cycle) * kneeAmp;
+
+    j.leftShoulder.rotation.x  = -cycle * armAmp;
+    j.rightShoulder.rotation.x =  cycle * armAmp;
   }
 
   dispose(scene) {
