@@ -34,7 +34,7 @@ const path = require('path');
 const Config = require('../config/constants');
 const MessageTypes = require('../network/MessageTypes');
 const GameWebSocketServer = require('../network/WebSocketServer');
-const { serveIndexIfRoot } = require('../shared/staticServer');
+const { serveStatic } = require('../shared/staticServer');
 const { readJsonBody, sendJson } = require('../shared/httpJson');
 
 const WorldRegistry = require('./WorldRegistry');
@@ -42,6 +42,7 @@ const AssignmentService = require('./AssignmentService');
 
 const PORT = Config.GATEWAY.PORT;
 const INDEX_HTML_PATH = path.join(__dirname, '..', 'index.html');
+const STATIC_ROOT     = path.dirname(INDEX_HTML_PATH);
 
 const registry = new WorldRegistry();
 const assignmentService = new AssignmentService(registry);
@@ -58,7 +59,7 @@ registry.startKeepAlive(Config.KEEP_ALIVE.WORLD_SERVER_URLS);
 // servers use to announce themselves and their populations.
 // -------------------------------------------------------------------------
 const httpServer = http.createServer(async (req, res) => {
-  if (serveIndexIfRoot(req, res, INDEX_HTML_PATH)) return;
+  if (serveStatic(req, res, STATIC_ROOT)) return;
 
   if (req.method === 'POST' && req.url === '/gateway/register') {
     try {
