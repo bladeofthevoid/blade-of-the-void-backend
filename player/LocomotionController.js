@@ -47,6 +47,14 @@ export class LocomotionController {
 
     /** Smoothed normalised speed (0–1) — lags slightly to avoid jitter. */
     this.smoothNorm  = 0;
+
+    /**
+     * Tracks how long the player has been in run-band speed (≥ RUN_MAX)
+     * while in the RUN phase. Breakstride only fires once this exceeds
+     * MIN_RUN_BEFORE_BREAK, preventing the instant breakstride on first
+     * full-speed keypress. Resets when leaving RUN or dropping below RUN_MAX.
+     */
+    this._runAtBreakspeedTime = 0;
   }
 
   // ── Public API ──────────────────────────────────────────────────────────
@@ -67,6 +75,15 @@ export class LocomotionController {
     this.smoothNorm  = this.smoothNorm + (raw - this.smoothNorm) * Math.min(1, dt * 12);
 
     const desired = this._classify(this.smoothNorm, hasInput);
+
+    // Accumulate "sustained breakspeed" time while in RUN phase.
+    // Resets the moment speed drops below RUN_MAX so the player has to
+    // genuinely hold top-end speed to earn the breakstride transition.
+    if (this.phase === LocomotionPhase.RUN && this.smoothNorm >= PhaseThresholds.RUN_MAX) {
+      this._runAtBreakspeedTime += dt;
+    } else {
+      this._runAtBreakspeedTime = 0;
+    }
 
     if (desired !== this.phase && this._canTransition(desired)) {
       this._transition(desired);
@@ -111,10 +128,25 @@ export class LocomotionController {
   /**
    * Hysteresis guard — enforce minimum time in current phase before
    * allowing a transition. Prevents threshold-boundary flickering.
+   *
+   * Special case for RUN → BREAKSTRIDE:
+   *   Uses a separate "sustained breakspeed" timer rather than generic
+   *   timeInPhase so that the guard only fires on the upgrade path,
+   *   leaving the RUN → DRIFT (deceleration / stop) path unaffected.
+   *   This is what stops the player hitting breakstride in < 1 second.
+   *
    * @param {string} desired  The phase we want to move to
    * @returns {boolean}
    */
   _canTransition(desired) {
+    // Dedicated earned-breakstride gate: must hold run-band speed for
+    // MIN_RUN_BEFORE_BREAK seconds continuously before the animation
+    // upgrades to breakstride. Normal hysteresis does not apply here
+    // because we want the downward (deceleration) path to stay fast.
+    if (desired === LocomotionPhase.BREAKSTRIDE && this.phase === LocomotionPhase.RUN) {
+      return this._runAtBreakspeedTime >= AnimConfig.MIN_RUN_BEFORE_BREAK;
+    }
+
     const mins = {
       [LocomotionPhase.IDLE]:        AnimConfig.MIN_IN_IDLE,
       [LocomotionPhase.DRIFT]:       AnimConfig.MIN_IN_DRIFT,
@@ -130,11 +162,12 @@ export class LocomotionController {
    * @param {string} newPhase
    */
   _transition(newPhase) {
-    this.prevPhase     = this.phase;
-    this.phase         = newPhase;
-    this.timeInPhase   = 0;
-    this.blendWeight   = 0;
-    this.blendDuration = this._blendDuration(newPhase);
+    this.prevPhase              = this.phase;
+    this.phase                  = newPhase;
+    this.timeInPhase            = 0;
+    this.blendWeight            = 0;
+    this.blendDuration          = this._blendDuration(newPhase);
+    this._runAtBreakspeedTime   = 0;   // always reset — must re-earn on re-entry
   }
 
   /**
