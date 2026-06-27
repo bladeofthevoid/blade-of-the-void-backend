@@ -48,7 +48,9 @@ export const PhaseThresholds = Object.freeze({
   // Drift:       0 %  → DRIFT_MAX
   DRIFT_MAX:  0.45,
   // Run:         DRIFT_MAX → RUN_MAX
-  RUN_MAX:    0.80,
+  // Raised to 0.86 so you must be at 86 % of max speed — not just
+  // crossing the threshold, but genuinely committed to full running.
+  RUN_MAX:    0.86,
   // Breakstride: RUN_MAX → 100 %  (no upper threshold — it's the top band)
 });
 
@@ -95,8 +97,8 @@ export const AnimConfig = Object.freeze({
   // ── State-transition blend durations (seconds) ─────────────────────────
   BLEND_IDLE_IN:           0.28,
   BLEND_DRIFT_IN:          0.10,   // drift must feel instant
-  BLEND_RUN_IN:            0.18,
-  BLEND_BREAKSTRIDE_IN:    0.24,
+  BLEND_RUN_IN:            0.20,
+  BLEND_BREAKSTRIDE_IN:    0.30,   // slightly longer so the shift feels weighty
   BLEND_STOP:              0.22,
 
   // ── Hysteresis — minimum time before a phase transition fires ──────────
@@ -104,7 +106,13 @@ export const AnimConfig = Object.freeze({
   MIN_IN_IDLE:        0.08,
   MIN_IN_DRIFT:       0.04,
   MIN_IN_RUN:         0.10,
-  MIN_IN_BREAKSTRIDE: 0.14,
+  // How long you must stay in BREAKSTRIDE before you can leave it.
+  // Keeps the exaggerated pose from flickering if speed dips briefly.
+  MIN_IN_BREAKSTRIDE: 0.40,
+  // ← KEY: how long you must SUSTAIN run-band speed before breakstride
+  // fires. This is the guard that stops you hitting it in <1 second.
+  // ~0.75 s of real running earns the transition.
+  MIN_RUN_BEFORE_BREAK: 0.75,
 
   // ── Idle animation ─────────────────────────────────────────────────────
   // Very subtle — the Dead Star should feel contained, not human.
@@ -117,25 +125,44 @@ export const AnimConfig = Object.freeze({
   IDLE_SHOULDER_DROP:  0.020,  // passive shoulder settlement (rotation.x)
 
   // ── Walk-cycle step frequencies (cycles / second) ──────────────────────
-  // Step speed is multiplied by normalised velocity so the cycle slows
-  // at low speed and never looks like marching-in-place.
-  STEP_HZ_DRIFT:       3.0,
-  STEP_HZ_RUN:         3.7,
-  STEP_HZ_BREAKSTRIDE: 2.5,   // long deliberate strides — slower turnover
+  // Lower = longer, more deliberate strides. The cycle is also scaled
+  // by normalised speed in Animator so slow movement never looks like
+  // marching in place — these are the FULL-SPEED frequencies.
+  //
+  //   Drift:       ~1 stride per 0.53 s  — measured repositioning steps
+  //   Run:         ~1 stride per 0.43 s  — long deliberate running
+  //   Breakstride: ~1 stride per 0.67 s  — massive, lunging power strides
+  STEP_HZ_DRIFT:       1.90,
+  STEP_HZ_RUN:         2.30,
+  STEP_HZ_BREAKSTRIDE: 1.50,
 
   // ── Limb swing amplitudes (radians) ────────────────────────────────────
-  LEG_AMP_DRIFT:       0.32,
-  LEG_AMP_RUN:         0.52,
-  LEG_AMP_BREAKSTRIDE: 0.70,
+  // Significantly larger than before. Combined with the lower frequencies
+  // above this produces long, sweeping strides rather than short quick ones.
+  //
+  // Breakstride is intentionally extreme — it should read as a committed,
+  // almost lunging gait. The Dead Star's body commits hard to each stride.
+  //
+  //   Drift:       ~37 °  — visible but contained
+  //   Run:         ~57 °  — unmistakably a real run
+  //   Breakstride: ~89 °  — exaggerated, powerful, almost theatrical
+  LEG_AMP_DRIFT:       0.65,
+  LEG_AMP_RUN:         1.00,
+  LEG_AMP_BREAKSTRIDE: 1.55,
 
-  ARM_AMP_RATIO:       0.28,   // arm swing = leg swing × this
-  KNEE_AMP_RATIO:      0.80,   // knee bend  = leg swing × this
+  // Arms swing hard — the Dead Star uses its whole body at speed.
+  ARM_AMP_RATIO:       0.60,   // arm swing = leg swing × this
+  //   Drift arm:       ~22 °
+  //   Run arm:         ~34 °
+  //   Breakstride arm: ~53 °  — dramatic windmill at full commit
+  KNEE_AMP_RATIO:      0.82,   // knee bend  = leg swing × this
 
-  // ── Torso — Dead Stars are stable, not bouncy ──────────────────────────
-  TORSO_BOUNCE_RATIO:  0.016,  // vertical chest bob   = leg amp × this (tiny)
-  TORSO_LEAN_DRIFT:    0.022,  // forward lean at drift
-  TORSO_LEAN_RUN:      0.050,  // forward lean at run
-  TORSO_LEAN_BREAK:    0.095,  // lower posture at breakstride
+  // ── Torso — stable in drift, progressively heavier lean at speed ───────
+  // Dead Stars don't bounce, but they DO lean into their movement hard.
+  TORSO_BOUNCE_RATIO:  0.028,  // vertical chest bob = leg amp × this
+  TORSO_LEAN_DRIFT:    0.050,  // forward lean at drift  (~3 °)
+  TORSO_LEAN_RUN:      0.130,  // forward lean at run    (~7.5 °)
+  TORSO_LEAN_BREAK:    0.300,  // forward lean at break  (~17 °) — heavy commitment
 
   // ── Head levelling ─────────────────────────────────────────────────────
   // Counter-rotate head by this fraction of the torso's forward lean so
@@ -148,8 +175,6 @@ export const AnimConfig = Object.freeze({
   HEAD_WOBBLE_AMP:     0.14,   // precession wobble amplitude (rad)
 
   // ── Camera velocity anticipation ──────────────────────────────────────
-  // Shifts the camera look-at slightly ahead of movement direction so
-  // the player can see where they're going without FOV tricks.
-  CAM_ANTICIPATION_MAX:  0.85,  // max world-unit offset along velocity
-  CAM_ANTICIPATION_LERP: 0.08,  // per-frame blend coefficient
+  CAM_ANTICIPATION_MAX:  0.85,
+  CAM_ANTICIPATION_LERP: 0.08,
 });
