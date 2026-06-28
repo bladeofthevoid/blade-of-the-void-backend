@@ -39,11 +39,28 @@ module.exports = {
   SNAPSHOT_RATE: 20, // Hz
 
   // Movement tuning. Shared verbatim with the client for prediction.
+  //
+  // Phase-based speed caps:
+  //   The server reads `input.phase` from each input packet and selects
+  //   the appropriate speed cap so that each locomotion phase has a real,
+  //   server-enforced top speed — not just a visual animation difference.
+  //
+  //   DRIFT_SPEED       — repositioning / micro-movement (≈ 39 % of max)
+  //   RUN_SPEED         — standard combat movement (original top speed)
+  //   BREAKSTRIDE_SPEED — committed sprint; the true MAX_SPEED
+  //
+  //   Clients that send no phase (or an unknown one) are capped at
+  //   RUN_SPEED, which is a safe conservative fallback — a legitimate
+  //   client is always in a known phase.  This also means a cheating
+  //   client cannot exceed RUN_SPEED just by omitting the phase field.
   MOVEMENT: {
-    MAX_SPEED: 6.0,       // m/s, top horizontal movement speed
-    ACCELERATION: 40.0,   // m/s^2 applied while there is movement input
-    FRICTION: 18.0,       // m/s^2 deceleration applied while there is no input
-    TURN_RATE: 12.0,      // rad/s, how fast the entity's facing rotates to match its movement direction
+    MAX_SPEED:         9.0,   // absolute hard cap = BREAKSTRIDE_SPEED
+    DRIFT_SPEED:       3.5,   // m/s cap while in drift phase
+    RUN_SPEED:         6.0,   // m/s cap while in run phase (was the old MAX_SPEED)
+    BREAKSTRIDE_SPEED: 9.0,   // m/s cap while in breakstride phase (~50% faster than run)
+    ACCELERATION:     40.0,   // m/s² applied while movement input is held
+    FRICTION:         18.0,   // m/s² deceleration when input is released
+    TURN_RATE:        12.0,   // rad/s — how fast facing tracks movement direction
   },
 
   // World bounds. Today this is just a simple square clamp; it exists as a
