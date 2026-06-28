@@ -251,8 +251,18 @@ class MovementSystem {
       const nx = dirX / len;
       const nz = dirZ / len;
 
-      const targetVX = nx * cfg.MAX_SPEED;
-      const targetVZ = nz * cfg.MAX_SPEED;
+      // Phase-based speed cap — identical logic to server MovementSystem.
+      // input.phase is set by PlayerController before the input is sent.
+      // Unknown / absent phase defaults to RUN_SPEED so a legitimately
+      // drifting or idle player is never capped higher than run speed.
+      const phaseSpeed = {
+        drift:       cfg.DRIFT_SPEED,
+        run:         cfg.RUN_SPEED,
+        breakstride: cfg.BREAKSTRIDE_SPEED,
+      }[input.phase] ?? (cfg.RUN_SPEED ?? cfg.MAX_SPEED);
+
+      const targetVX = nx * phaseSpeed;
+      const targetVZ = nz * phaseSpeed;
 
       state.velocity.x = MovementSystem._approach(state.velocity.x, targetVX, cfg.ACCELERATION * dt);
       state.velocity.z = MovementSystem._approach(state.velocity.z, targetVZ, cfg.ACCELERATION * dt);
@@ -592,8 +602,7 @@ class CameraController {
     if (!this._anticipation) this._anticipation = { x: 0, z: 0 };
     if (velocity) {
       const spd    = Math.hypot(velocity.x, velocity.z);
-      const maxSpd = 6.0;   // matches server MAX_SPEED; minor if it drifts
-      const factor = Math.min(spd / maxSpd, 1.0) * 0.85;
+      const factor = Math.min(spd / 9.0, 1.0) * 0.85;
       const tx = spd > 0.05 ? (velocity.x / spd) * factor : 0;
       const tz = spd > 0.05 ? (velocity.z / spd) * factor : 0;
       this._anticipation.x += (tx - this._anticipation.x) * 0.08;
@@ -1148,10 +1157,16 @@ class Predictor {
    * cfgOverride lets PlayerController supply phase-specific acceleration /
    * friction / turn-rate multipliers during forward prediction without
    * touching reconciliation (which always replays with the flat server cfg).
+   *
+   * phase is included in the input object so that:
+   *   1. The server receives it and applies the correct speed cap.
+   *   2. Reconciliation replays use the same phase, keeping client and
+   *      server running byte-for-byte identical MovementSystem logic.
    */
-  step(dirX, dirZ, dt, cfgOverride = null) {
+  step(dirX, dirZ, dt, cfgOverride = null, phase = null) {
     this.seqCounter++;
     const input = { seq: this.seqCounter, dirX, dirZ };
+    if (phase) input.phase = phase;   // sent to server; replayed during reconcile
 
     MovementSystem.step(this.state, input, dt, cfgOverride ?? this.cfg);
 
