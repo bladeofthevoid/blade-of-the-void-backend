@@ -47,13 +47,18 @@ export const PhaseThresholds = Object.freeze({
   IDLE_MAX:   0.05,
 
   // Phase boundaries expressed as fractions of MAX_SPEED (= BREAKSTRIDE_SPEED = 9.0):
-  //   DRIFT_MAX  = DRIFT_SPEED  / MAX_SPEED = 3.5 / 9.0 ≈ 0.389 → 0.40
-  //   RUN_MAX    = RUN_SPEED    / MAX_SPEED = 6.0 / 9.0 ≈ 0.667 → 0.67
+  //   DRIFT_MAX  = DRIFT_SPEED  / MAX_SPEED = 3.5 / 9.0 ≈ 0.389 → 0.38
+  //   RUN_MAX    = RUN_SPEED    / MAX_SPEED = 6.0 / 9.0 ≈ 0.667 → 0.65
   //
-  // These match the server's phase speed caps so the locomotion phase always
-  // reflects the actual physics phase — not an approximation of it.
-  DRIFT_MAX:  0.40,
-  RUN_MAX:    0.67,
+  // IMPORTANT: these must be set BELOW the actual speed ratios, not above them.
+  // When in drift phase, velocity is server-capped at DRIFT_SPEED (3.5 m/s),
+  // so smoothNorm tops out at 3.5/9.0 = 0.389. A threshold of 0.40 would be
+  // unreachable, permanently trapping the player in drift. Same logic applies
+  // to RUN_MAX: run is capped at 6.0/9.0 = 0.667, so 0.67 is unreachable.
+  // Setting both slightly below the ratio lets a player at full phase speed
+  // cross the threshold and trigger the transition to the next phase.
+  DRIFT_MAX:  0.38,
+  RUN_MAX:    0.65,
 });
 
 /**
@@ -142,13 +147,22 @@ export const AnimConfig = Object.freeze({
   //   Go shorter for a quicker, lighter-footed style.
   //   Go longer for a heavier, more deliberate stride.
   //
-  // At MAX_SPEED = 6 m/s the effective Hz for each phase is:
-  //   drift:       6 / 0.90 = 6.7 Hz  (quick, many small steps)
-  //   run:         6 / 1.70 = 3.5 Hz  (deliberate long strides)
-  //   breakstride: 6 / 2.20 = 2.7 Hz  (massive, ground-eating strides)
-  STRIDE_LENGTH_DRIFT:       0.90,   // shorter than visual arc → light, quick repositioning
-  STRIDE_LENGTH_RUN:         1.70,   // closely matched to visual arc → planted, deliberate
-  STRIDE_LENGTH_BREAKSTRIDE: 2.20,   // matched to max visual arc → each stride feels committed
+  // Calibrated against the actual per-phase speed caps so Hz at each
+  // phase's top speed feels proportionate to real movement:
+  //   drift:       3.5 / 1.75 = 2.0 Hz  (deliberate repositioning steps)
+  //   run:         6.0 / 2.50 = 2.4 Hz  (flowing, committed run)
+  //   breakstride: 9.0 / 3.30 = 2.7 Hz  (massive, ground-eating strides)
+  //
+  // NOTE: the old strides (0.90 / 1.70 / 2.20) were written when all phases
+  // ran at MAX_SPEED = 6 m/s. With BREAKSTRIDE_SPEED now 9 m/s, that old
+  // value pushed breakstride Hz from 2.7 up to 4.1 — legs visibly cycling
+  // far faster than the player was moving. Drift has the same root problem:
+  // stride 0.90 m is shorter than the foot arc (~1.04 m at drift speed),
+  // so feet appeared faster than ground movement each cycle. All three
+  // values are scaled to the new speed caps to restore the intended feel.
+  STRIDE_LENGTH_DRIFT:       1.75,   // 2.0 Hz at DRIFT_SPEED (3.5 m/s) — legs match ground pace
+  STRIDE_LENGTH_RUN:         2.50,   // 2.4 Hz at RUN_SPEED   (6.0 m/s) — long, deliberate strides
+  STRIDE_LENGTH_BREAKSTRIDE: 3.30,   // 2.7 Hz at BREAK_SPEED (9.0 m/s) — restores original design Hz
 
   // ── BREAKSTRIDE SPEED ──────────────────────────────────────────────────
   // Breakstride IS faster than run.  The server reads input.phase and caps
